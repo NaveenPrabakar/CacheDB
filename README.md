@@ -13,6 +13,7 @@ CacheDB provides an in-memory cache with automatic write-behind persistence to a
 - **Crash recovery**: Automatically recovers unflushed writes from WAL on startup
 - **Multi-table support**: Handles multiple tables with different schemas
 - **Composite primary keys**: Supports tables with composite primary keys
+- **Built-in dashboard**: Real-time web-based monitoring dashboard (enabled by default)
 
 ## Architecture
 
@@ -98,7 +99,10 @@ DataSource ds = new SimpleDataSource(
 CacheDB cache = CacheDB.builder()
     .dataSource(ds)
     .ttlSeconds(2)  // Cache entries expire after 2 seconds
+    .dashboard(true)  // Enable dashboard (default: true)
+    .dashboardPort(8080)  // Dashboard port (default: 8080)
     .build();
+// Dashboard automatically starts at http://localhost:8080
 ```
 
 ### Writing Data
@@ -171,6 +175,41 @@ Map<String, Object> item = cache.get(
 // Manually checkpoint WAL after important operations
 cache.checkpoint();
 ```
+
+### Dashboard
+
+CacheDB includes a built-in web dashboard for real-time monitoring. The dashboard starts automatically when CacheDB is initialized.
+
+```java
+// Dashboard is enabled by default
+CacheDB cache = CacheDB.builder()
+    .dataSource(ds)
+    .ttlSeconds(2)
+    .build();
+// Dashboard available at: http://localhost:8080
+
+// Disable dashboard if needed
+CacheDB cache = CacheDB.builder()
+    .dataSource(ds)
+    .ttlSeconds(2)
+    .dashboard(false)  // Disable dashboard
+    .build();
+
+// Customize dashboard port
+CacheDB cache = CacheDB.builder()
+    .dataSource(ds)
+    .ttlSeconds(2)
+    .dashboardPort(9090)  // Use custom port
+    .build();
+```
+
+**Dashboard Features:**
+- Real-time statistics (updates every second)
+- Operation tracking (reads, writes, deletes)
+- Cache hit rate monitoring
+- WAL size and status
+- Performance metrics
+- Modern, responsive UI
 
 ## How It Works
 

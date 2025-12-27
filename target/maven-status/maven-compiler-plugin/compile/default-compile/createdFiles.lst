@@ -4,11 +4,15 @@ cachedb\benchmark\GetLatencyBenchmark.class
 cachedb\SchemaRegistry.class
 cachedb\TableMeta.class
 cachedb\FlushManager.class
+cachedb\Dashboard$OperationsHandler.class
 cachedb\CacheDB.class
+cachedb\Dashboard$DashboardHandler.class
 cachedb\WALWriter.class
 cachedb\ExpirationManager.class
 cachedb\benchmark\WalGrowthBenchmark.class
+cachedb\Dashboard$StatsHandler.class
 cachedb\CacheStore.class
+cachedb\Dashboard.class
 cachedb\benchmark\SetLatencyBenchmark.class
 cachedb\DB.class
 cachedb\Main.class
@@ -18,6 +22,8 @@ cachedb\LogSerializer.class
 cachedb\benchmark\CrashRecoveryWriter.class
 cachedb\SimpleDataSource.class
 cachedb\FlushTask.class
+cachedb\Dashboard$DashboardStats.class
+cachedb\Dashboard$WALHandler.class
 cachedb\CacheEntry.class
 cachedb\WALReader.class
 cachedb\SqlBuilder.class

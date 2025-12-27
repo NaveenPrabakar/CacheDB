@@ -15,17 +15,31 @@ public final class CacheDB {
     private final CacheStore store;
     private final ExpirationManager expirationManager;
     private final WALWriter wal;
+    private Dashboard dashboard;
 
     private CacheDB(CacheStore store,
-                    ExpirationManager expirationManager) throws IOException {
+                    ExpirationManager expirationManager,
+                    Dashboard dashboard) throws IOException {
 
         this.store = store;
         this.expirationManager = expirationManager;
+        this.dashboard = dashboard;
 
         Files.createDirectories(WAL_PATH.getParent());
         this.wal = new WALWriter(WAL_PATH);
 
         recover();
+    }
+
+    private void setDashboard(Dashboard dashboard) {
+        this.dashboard = dashboard;
+        if (dashboard != null) {
+            try {
+                dashboard.start();
+            } catch (IOException e) {
+                System.err.println("Warning: Failed to start dashboard: " + e.getMessage());
+            }
+        }
     }
 
     public synchronized void checkpoint() {
@@ -80,11 +94,27 @@ public final class CacheDB {
         }
 
         store.upsert(table, primaryKey, columns);
+        
+        // Track write operation
+        if (dashboard != null) {
+            dashboard.recordWrite();
+        }
     }
 
     public Map<String, Object> get(String table,
                                    Map<String, Object> primaryKey) {
-        return store.get(table, primaryKey);
+        Map<String, Object> result = store.get(table, primaryKey);
+        
+        // Track read operation
+        if (dashboard != null) {
+            if (result != null) {
+                dashboard.recordRead();
+            } else {
+                dashboard.recordMiss();
+            }
+        }
+        
+        return result;
     }
 
     public void delete(String table,
@@ -103,6 +133,11 @@ public final class CacheDB {
         }
 
         store.delete(table, primaryKey);
+        
+        // Track delete operation
+        if (dashboard != null) {
+            dashboard.recordDelete();
+        }
     }
 
     /* ------------ BUILDER ------------ */
@@ -115,6 +150,8 @@ public final class CacheDB {
 
         private DataSource dataSource;
         private long ttlMillis = 2000;
+        private boolean dashboardEnabled = true;
+        private int dashboardPort = 8080;
 
         public Builder dataSource(DataSource ds) {
             this.dataSource = ds;
@@ -123,6 +160,16 @@ public final class CacheDB {
 
         public Builder ttlSeconds(long seconds) {
             this.ttlMillis = seconds * 1000;
+            return this;
+        }
+
+        public Builder dashboard(boolean enabled) {
+            this.dashboardEnabled = enabled;
+            return this;
+        }
+
+        public Builder dashboardPort(int port) {
+            this.dashboardPort = port;
             return this;
         }
 
@@ -143,7 +190,14 @@ public final class CacheDB {
             new Thread(flushManager, "flush-thread").start();
             new Thread(expirationManager, "expiration-thread").start();
 
-            return new CacheDB(store, expirationManager);
+            CacheDB cacheDB = new CacheDB(store, expirationManager, null);
+            
+            if (dashboardEnabled) {
+                Dashboard dashboard = new Dashboard(cacheDB, store, dashboardPort);
+                cacheDB.setDashboard(dashboard);
+            }
+
+            return cacheDB;
         }
 
 
