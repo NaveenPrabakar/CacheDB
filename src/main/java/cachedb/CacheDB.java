@@ -15,18 +15,20 @@ public final class CacheDB {
     private final CacheStore store;
     private final ExpirationManager expirationManager;
     private final WALWriter wal;
+    private final WalCheckpointCoordinator checkpointCoordinator;
     private Dashboard dashboard;
 
     private CacheDB(CacheStore store,
                     ExpirationManager expirationManager,
+                    WALWriter wal,
+                    WalCheckpointCoordinator checkpointCoordinator,
                     Dashboard dashboard) throws IOException {
 
         this.store = store;
         this.expirationManager = expirationManager;
+        this.wal = wal;
+        this.checkpointCoordinator = checkpointCoordinator;
         this.dashboard = dashboard;
-
-        Files.createDirectories(WAL_PATH.getParent());
-        this.wal = new WALWriter(WAL_PATH);
 
         recover();
     }
@@ -42,34 +44,46 @@ public final class CacheDB {
         }
     }
 
-    public synchronized void checkpoint() {
-        try {
-            wal.sync();
-            wal.truncate();
-        } catch (Exception e) {
-            // swallow
-        }
+    /**
+     * Requests an explicit checkpoint. This is a best-effort operation: the WAL is only
+     * truncated if every mutation currently represented in it has already been
+     * confirmed durable in the backing store (see {@link WalCheckpointCoordinator}).
+     * Always safe to call.
+     */
+    public void checkpoint() {
+        checkpointCoordinator.checkpointIfSafe();
     }
-
 
     private void recover() throws IOException {
         if (!Files.exists(WAL_PATH)) return;
 
-        WALReader reader = new WALReader(WAL_PATH);
+        try (WALReader reader = new WALReader(WAL_PATH)) {
+            for (LogRecord r : reader) {
+                String key = new String(r.key());
+                // key format: table|{pk} — identical to CacheKeys.identity(table, pk)
+                // for the ORIGINAL (pre-recovery) primary key, since that's exactly how
+                // it was serialized when the record was first appended.
+                String[] parts = key.split("\\|", 2);
+                String table = parts[0];
+                Map<String, Object> pk = SimpleCodec.parseMap(parts[1]);
 
-        for (LogRecord r : reader) {
-            String key = new String(r.key());
-            // key format: table|{pk}
-            String[] parts = key.split("\\|", 2);
-            String table = parts[0];
-            Map<String, Object> pk = SimpleCodec.parseMap(parts[1]);
-
-            if (r.type() == LogType.PUT) {
-                String value = new String(r.value());
-                Map<String, Object> cols = SimpleCodec.parseMap(value);
-                store.upsert(table, pk, cols);
-            } else if (r.type() == LogType.DELETE) {
-                store.delete(table, pk);
+                if (r.type() == LogType.PUT) {
+                    String value = new String(r.value());
+                    Map<String, Object> cols = SimpleCodec.parseMap(value);
+                    long version = checkpointCoordinator.trackExisting(key);
+                    store.upsert(table, pk, cols, version);
+                } else if (r.type() == LogType.DELETE) {
+                    long version = checkpointCoordinator.trackExisting(key);
+                    boolean resident = store.delete(table, pk, version);
+                    if (!resident) {
+                        // No entry was replayed for this key before the delete (e.g. its
+                        // PUT record was already checkpointed away pre-crash). Nothing
+                        // will ever expire/flush it, so acknowledge it immediately rather
+                        // than letting it block the WAL from ever being checkpointed
+                        // again — same reasoning as delete() below, tied to defect C4.
+                        checkpointCoordinator.recordFlushed(key, version);
+                    }
+                }
             }
         }
     }
@@ -82,19 +96,19 @@ public final class CacheDB {
         Objects.requireNonNull(primaryKey);
         Objects.requireNonNull(columns);
 
-        byte[] walKey =
-                (table + "|" + primaryKey.toString()).getBytes();
-        byte[] walValue =
-                columns.toString().getBytes();
+        String keyId = CacheKeys.identity(table, primaryKey);
+        byte[] walKey = keyId.getBytes();
+        byte[] walValue = columns.toString().getBytes();
 
+        long version;
         try {
-            wal.append(LogRecord.put(walKey, walValue));
+            version = checkpointCoordinator.appendAndTrack(LogRecord.put(walKey, walValue), keyId);
         } catch (IOException e) {
             throw new RuntimeException("WAL write failed", e);
         }
 
-        store.upsert(table, primaryKey, columns);
-        
+        store.upsert(table, primaryKey, columns, version);
+
         // Track write operation
         if (dashboard != null) {
             dashboard.recordWrite();
@@ -104,7 +118,7 @@ public final class CacheDB {
     public Map<String, Object> get(String table,
                                    Map<String, Object> primaryKey) {
         Map<String, Object> result = store.get(table, primaryKey);
-        
+
         // Track read operation
         if (dashboard != null) {
             if (result != null) {
@@ -113,7 +127,7 @@ public final class CacheDB {
                 dashboard.recordMiss();
             }
         }
-        
+
         return result;
     }
 
@@ -123,17 +137,25 @@ public final class CacheDB {
         Objects.requireNonNull(table);
         Objects.requireNonNull(primaryKey);
 
-        byte[] walKey =
-                (table + "|" + primaryKey.toString()).getBytes();
+        String keyId = CacheKeys.identity(table, primaryKey);
+        byte[] walKey = keyId.getBytes();
 
+        long version;
         try {
-            wal.append(LogRecord.delete(walKey));
+            version = checkpointCoordinator.appendAndTrack(LogRecord.delete(walKey), keyId);
         } catch (IOException e) {
             throw new RuntimeException("WAL write failed", e);
         }
 
-        store.delete(table, primaryKey);
-        
+        boolean resident = store.delete(table, primaryKey, version);
+        if (!resident) {
+            // Nothing in cache to expire/flush for this key (defect C4: a delete of a
+            // non-resident key never reaches the database today). No future flush will
+            // ever confirm this WAL record, so acknowledge it immediately rather than
+            // letting it block the WAL from being checkpointed again.
+            checkpointCoordinator.recordFlushed(keyId, version);
+        }
+
         // Track delete operation
         if (dashboard != null) {
             dashboard.recordDelete();
@@ -181,8 +203,12 @@ public final class CacheDB {
 
             CacheStore store = new CacheStore(ttlMillis);
 
+            Files.createDirectories(WAL_PATH.getParent());
+            WALWriter wal = new WALWriter(WAL_PATH);
+            WalCheckpointCoordinator checkpointCoordinator = new WalCheckpointCoordinator(wal);
+
             FlushManager flushManager =
-                    new FlushManager(dataSource, schemaRegistry);
+                    new FlushManager(dataSource, schemaRegistry, checkpointCoordinator);
 
             ExpirationManager expirationManager =
                     new ExpirationManager(store, flushManager);
@@ -190,8 +216,8 @@ public final class CacheDB {
             new Thread(flushManager, "flush-thread").start();
             new Thread(expirationManager, "expiration-thread").start();
 
-            CacheDB cacheDB = new CacheDB(store, expirationManager, null);
-            
+            CacheDB cacheDB = new CacheDB(store, expirationManager, wal, checkpointCoordinator, null);
+
             if (dashboardEnabled) {
                 Dashboard dashboard = new Dashboard(cacheDB, store, dashboardPort);
                 cacheDB.setDashboard(dashboard);

@@ -11,10 +11,12 @@ public class FlushManager implements Runnable {
     private final BlockingQueue<FlushTask> queue = new LinkedBlockingQueue<>();
     private final DataSource dataSource;
     private final SchemaRegistry schemaRegistry;
+    private final WalCheckpointCoordinator checkpointCoordinator;
 
-    public FlushManager(DataSource ds, SchemaRegistry schemaRegistry) {
+    public FlushManager(DataSource ds, SchemaRegistry schemaRegistry, WalCheckpointCoordinator checkpointCoordinator) {
         this.dataSource = ds;
         this.schemaRegistry = schemaRegistry;
+        this.checkpointCoordinator = checkpointCoordinator;
     }
 
     public void enqueue(FlushTask task) {
@@ -52,7 +54,7 @@ public class FlushManager implements Runnable {
 
                     try {
                         ps.executeUpdate();
-                        checkpoint();
+                        acknowledgeFlush(m);
                     } catch (Exception e) {
                         // DB down → WAL preserved
                     }
@@ -81,7 +83,7 @@ public class FlushManager implements Runnable {
 
                     try {
                         ps.executeUpdate();
-                        checkpoint();
+                        acknowledgeFlush(m);
                     } catch (Exception e) {
                         // DB down → WAL preserved
                     }
@@ -92,14 +94,12 @@ public class FlushManager implements Runnable {
         }
     }
 
-    private void checkpoint() {
-        try {
-            WALWriter wal = WALWriter.getInstance();
-            wal.sync();
-            wal.truncate();
-        } catch (Exception e) {
-            // swallow — DB is already durable
-        }
+    /**
+     * Reports this mutation as durably persisted so the coordinator can checkpoint the
+     * WAL once every currently-outstanding mutation has been confirmed (see C1).
+     */
+    private void acknowledgeFlush(RowMutation m) {
+        checkpointCoordinator.recordFlushed(CacheKeys.identity(m.table, m.primaryKey), m.version);
     }
 
 }

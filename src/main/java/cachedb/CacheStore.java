@@ -15,9 +15,15 @@ public class CacheStore {
         this.ttlMillis = ttlMillis;
     }
 
+    /**
+     * @param version the durability-tracking version already assigned to this mutation
+     *                (see {@link WalCheckpointCoordinator}); stored on the entry so
+     *                downstream flush confirmation can reference it.
+     */
     public void upsert(String table,
                        Map<String, Object> pk,
-                       Map<String, Object> columns) {
+                       Map<String, Object> columns,
+                       long version) {
 
         String keyHash = hash(pk);
         long now = System.currentTimeMillis();
@@ -25,10 +31,12 @@ public class CacheStore {
         store.computeIfAbsent(table, t -> new ConcurrentHashMap<>())
                 .compute(keyHash, (k, existing) -> {
                     if (existing == null) {
-                        return new CacheEntry(pk, columns, now + ttlMillis);
+                        CacheEntry entry = new CacheEntry(pk, columns, now + ttlMillis);
+                        entry.version = version;
+                        return entry;
                     }
                     existing.columns = columns;
-                    existing.version++;
+                    existing.version = version;
                     existing.dirty = true;
                     existing.expiresAt = now + ttlMillis;
                     return existing;
@@ -48,7 +56,12 @@ public class CacheStore {
         return entry.columns;
     }
 
-    public boolean delete(String table, Map<String, Object> pk) {
+    /**
+     * @param version the durability-tracking version already assigned to this mutation.
+     * @return {@code true} if a resident entry was found and marked deleted;
+     *         {@code false} if the key wasn't in the cache (no-op — see defect C4).
+     */
+    public boolean delete(String table, Map<String, Object> pk, long version) {
         Map<String, CacheEntry> tableMap = store.get(table);
         if (tableMap == null) return false;
 
@@ -59,7 +72,7 @@ public class CacheStore {
         // Mark as deleted but keep entry for flushing
         entry.columns = null;
         entry.dirty = true;
-        entry.version++;
+        entry.version = version;
         return true;
     }
 
